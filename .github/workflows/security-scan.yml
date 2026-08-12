@@ -263,12 +263,41 @@ jobs:
 
           # --- package.json lifecycle-script check (postinstall/preinstall/prepare) ---
           # A NEW install-time script is the classic npm supply-chain foothold.
+          #
+          # Compare the hook's OLD value to its NEW value and report only a hook
+          # that is newly introduced, or that GAINED a command. An earlier version
+          # flagged any added line mentioning the hook, so
+          #   "patch-package && node scripts/pin-github-deps.js" -> "patch-package"
+          # failed CI — an edit that REMOVES a command and cannot add a foothold.
+          # Shrinking, removing, or reordering existing commands is not reported.
           if grep -qx 'package.json' "$FILELIST"; then
-            pkg_added="$(git diff "origin/${BASE_REF}...HEAD" -- package.json \
-                          | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//')"
-            echo "$pkg_added" | grep -qE '"(postinstall|preinstall|prepare)"[[:space:]]*:' \
-              && report "package.json" "NEW postinstall/preinstall/prepare lifecycle script added" \
-                        "$(echo "$pkg_added" | grep -E '"(postinstall|preinstall|prepare)"' | head -1)"
+            hookval() {   # hookval <ref> <hook>
+              git show "$1:package.json" 2>/dev/null \
+                | tr ',' '\n' \
+                | grep -E "\"$2\"[[:space:]]*:" \
+                | head -1 \
+                | sed -E 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"//; s/"[[:space:]]*$//'
+            }
+            cmds() { printf '%s\n' "$1" | tr ';|&' '\n' \
+                      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$'; }
+
+            for hook in postinstall preinstall prepare prepublish; do
+              hnew="$(hookval HEAD "$hook")"
+              hold="$(hookval "origin/${BASE_REF}" "$hook")"
+              [ "$hnew" = "$hold" ] && continue
+              [ -n "$hnew" ] || continue                      # hook removed -> fine
+              if [ -z "$hold" ]; then
+                report "package.json" "NEW $hook lifecycle script introduced" "$hnew"
+                continue
+              fi
+              gained=""
+              while IFS= read -r c; do
+                [ -n "$c" ] || continue
+                cmds "$hold" | grep -qxF "$c" || gained="$gained; $c"
+              done <<< "$(cmds "$hnew")"
+              [ -n "$gained" ] && report "package.json" \
+                "$hook gained a command it did not run before" "${gained#; }"
+            done
           fi
 
           echo "──────────────────────────────────────────────"
