@@ -106,10 +106,14 @@ jobs:
           done
 
           # (c) Anything at all referencing the known C2 host.
-          if git grep -lI '166\.88\.134\.62' -- . 2>/dev/null | grep -q .; then
+          # Exclude this workflow: the IOC is written here AS A PATTERN, so an
+          # unfiltered grep matches the scanner itself and fails every repo.
+          C2HITS=$(git grep -lI '166\.88\.134\.62' -- . 2>/dev/null \
+                    | grep -vE '(^|/)\.github/workflows/security-scan\.yml$')
+          if [ -n "$C2HITS" ]; then
             FAIL=1
             printf '::error::KNOWN C2 HOST 166.88.134.62 referenced\n'
-            git grep -lI '166\.88\.134\.62' -- . | sed 's/^/      /'
+            printf '%s\n' "$C2HITS" | sed 's/^/      /'
           fi
 
           [ "$FAIL" -eq 0 ] || { echo "::error::Editor-autorun / disguised-binary sweep FAILED"; exit 1; }
