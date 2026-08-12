@@ -1,0 +1,277 @@
+name: Security Scan (PR)
+
+# Blocks a PR that introduces obfuscated/malicious code or leaked secrets.
+#
+# Motivation: babel.config.js was backdoored with the same supply-chain malware
+# (myexploitss) seen in the sibling repos. The payload was a single obfuscated
+# line appended after the real config that did `global[..]=require` + built a
+# Function from an XOR-encoded blob + eval'd it + spawned a detached
+# child_process — an EtherHiding credential/wallet stealer that ran in Node on
+# every Babel load (local + CI).
+#
+# Job 1 (obfuscation-scan) greps ONLY the lines this PR ADDS for that class of
+# payload and fails with the exact file+pattern. Job 2 (secret-scan) runs gitleaks.
+# Both are quick and add-only; they do not touch the build/submit workflows.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, development, staging]
+
+# Least privilege: read the code, that's it.
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # 0. Full-file config sweep (push only). The diff scan below only sees lines a
+  #    PR ADDS, so a payload already sitting on the branch is invisible to it —
+  #    which is how infected babel/jest/postcss configs survived for weeks. This
+  #    re-reads the whole of every build-config file on each push. Small set, fast.
+  # ─────────────────────────────────────────────────────────────────────────
+  config-sweep:
+    name: Full-file config sweep
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Scan every build-config file in full
+        run: |
+          set +e -u
+          FAIL=0
+          FILES=$(git ls-files \
+            | grep -E '(^|/)(babel|jest|metro|next|postcss|tailwind|vite|app|fingerprint)\.config\.(js|cjs|mjs|ts)$' \
+            | grep -vE '(^|/)node_modules/')
+          [ -z "$FILES" ] && { echo "no config files"; exit 0; }
+          for f in $FILES; do
+            [ -f "$f" ] || continue
+            bad=""
+            grep -qE '(\\u[0-9a-fA-F]{4}){3,}' "$f" && bad="$bad \\uXXXX-obfuscation"
+            grep -qE 'child_process'              "$f" && bad="$bad child_process"
+            grep -qE '\beval[[:space:]]*\('       "$f" && bad="$bad eval("
+            grep -qE "global[[:space:]]*\[.*\][[:space:]]*=" "$f" && bad="$bad global[]="
+            awk 'length($0)>500{found=1} END{exit !found}' "$f" && bad="$bad >500-char-line"
+            if [ -n "$bad" ]; then
+              FAIL=1
+              printf '::error file=%s::MALWARE/OBFUSCATION in full file:%s\n' "$f" "$bad"
+              printf '  %s (%s bytes)\n' "$f" "$(wc -c <"$f" | tr -d ' ')"
+            else
+              printf '  ok  %s\n' "$f"
+            fi
+          done
+          [ "$FAIL" -eq 0 ] || { echo "::error::Config sweep FAILED"; exit 1; }
+          echo "Config sweep clean."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 0b. Editor-autorun + disguised-binary sweep.
+  #     The 2026-08 backdoor was NOT in a config file, so job 0/1 could not see
+  #     it. It was `.vscode/tasks.json` with runOn:folderOpen executing a fake
+  #     .woff2 that was really an obfuscated Node loader. Opening the folder in
+  #     ANY VS Code-family editor ran it — which is why it survived three machine
+  #     wipes and re-infected a rebuilt machine in 30 minutes.
+  # ─────────────────────────────────────────────────────────────────────────
+  editor-autorun-sweep:
+    name: Editor autorun / disguised binary sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Scan for folderOpen tasks and fake font/binary files
+        run: |
+          set +e -u
+          FAIL=0
+
+          # (a) Any editor task that runs automatically on folder open.
+          #     There is no legitimate reason for one of these in this codebase.
+          for f in $(git ls-files | grep -E '(^|/)\.vscode/(tasks|launch)\.json$'); do
+            if grep -qE '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$f"; then
+              FAIL=1
+              printf '::error file=%s::AUTORUN TASK: runOn folderOpen executes when the folder is opened\n' "$f"
+              grep -nE '"(label|command|runOn)"' "$f" | head -6 | sed 's/^/      /'
+            fi
+          done
+
+          # (b) A file with a font/binary extension whose magic bytes say otherwise.
+          #     Real: wOF2 wOFF OTTO 'true' 00 01 00 00. The payload was ASCII padded
+          #     with spaces so it looked blank in a diff.
+          for f in $(git ls-files | grep -iE '\.(woff2?|ttf|otf|eot|png|jpg|jpeg|gif|ico)$'); do
+            [ -s "$f" ] || continue
+            if file -b "$f" | grep -qiE 'ascii|utf-8|text'; then
+              FAIL=1
+              printf '::error file=%s::DISGUISED FILE: %s extension but content is TEXT (%s)\n' \
+                "$f" "${f##*.}" "$(file -b "$f")"
+              printf '      %s bytes, first bytes: %s\n' "$(wc -c <"$f" | tr -d ' ')" "$(head -c 24 "$f" | tr -d '\0' | cat -v)"
+            fi
+          done
+
+          # (c) Anything at all referencing the known C2 host.
+          if git grep -lI '166\.88\.134\.62' -- . 2>/dev/null | grep -q .; then
+            FAIL=1
+            printf '::error::KNOWN C2 HOST 166.88.134.62 referenced\n'
+            git grep -lI '166\.88\.134\.62' -- . | sed 's/^/      /'
+          fi
+
+          [ "$FAIL" -eq 0 ] || { echo "::error::Editor-autorun / disguised-binary sweep FAILED"; exit 1; }
+          echo "Editor autorun + disguised binary sweep clean."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Obfuscation / malware diff scan — self-contained bash+grep, no deps.
+  #    Scans ADDED lines only (so a clean base doesn't fail forever).
+  # ─────────────────────────────────────────────────────────────────────────
+  obfuscation-scan:
+    name: Obfuscation / malware diff scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for diff base)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan PR-added lines for danger patterns
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # NOT -e / pipefail: this scanner tracks findings with its own FAIL
+          # flag and exits explicitly at the end. Under GitHub's default `bash -e`
+          # + pipefail, a BENIGN `grep` returning non-zero (e.g. a deletion-only
+          # file where `grep '^+'` finds nothing) aborts the whole scan with NO
+          # finding — a false FAILURE that blocks clean PRs. Disable -e; keep -u.
+          set +e -u
+
+          # Files this PR touches (Added/Copied/Modified/Renamed), excluding
+          # things that legitimately contain long/opaque lines. Written to a
+          # temp file and iterated with `while read` (no bash-4 `mapfile`
+          # dependency — portable across runner shells).
+          FILELIST="$(mktemp)"
+          git diff --name-only --diff-filter=ACMR "origin/${BASE_REF}...HEAD" \
+            | grep -vE '(^|/)node_modules/' \
+            | grep -vE '\.min\.js$' \
+            | grep -vE '(^|/)(yarn\.lock|package-lock\.json|pnpm-lock\.yaml)$' \
+            | grep -vE '\.(png|jpg|jpeg|gif|webp|ico|pdf|ttf|otf|woff2?|keystore|jks|p8|p12|mobileprovision)$' \
+            | grep -vE '(^|/)\.github/workflows/security-scan\.yml$' \
+            > "$FILELIST" || true
+
+          FAIL=0
+          # report <file> <pattern-label> <matching-line>
+          report() {
+            FAIL=1
+            printf '::error file=%s::MALWARE/OBFUSCATION: %s\n' "$1" "$2"
+            printf '  ↳ %s\n' "$3" | cut -c1-200
+          }
+
+          # config files get the strictest treatment (this is where the babel
+          # payload lived, and where a network call has no business being).
+          is_config() {
+            case "$1" in
+              *.config.js|metro.config.js|babel.config.js|app.config.js) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            [ -f "$f" ] || continue   # deleted-then-listed guard
+
+            # ADDED lines only: unified diff '+' lines, strip the leading '+'.
+            added="$(git diff "origin/${BASE_REF}...HEAD" -- "$f" \
+                      | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//')"
+            [ -n "$added" ] || continue
+
+            # --- Universal danger patterns (any tracked source file) ---
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+
+              # dynamic code execution
+              echo "$line" | grep -qE '\beval[[:space:]]*\('                 && report "$f" "eval( — dynamic code execution" "$line"
+              echo "$line" | grep -qE '\bnew[[:space:]]+Function[[:space:]]*\(' && report "$f" "new Function( — dynamic code factory" "$line"
+              # child_process (the payload spawned a detached one)
+              echo "$line" | grep -qE 'child_process'                        && report "$f" "child_process reference" "$line"
+              echo "$line" | grep -qE "require\([[:space:]]*['\"]child_process['\"]" && report "$f" "require('child_process')" "$line"
+              # smuggling require/module into globals (the exact babel trick).
+              # NOTE: `.*` (not `[^]]*`) so it matches computed keys with nested
+              # brackets like `global[_$_1e42[0]]= require` — the real payload form.
+              echo "$line" | grep -qE "global[[:space:]]*\[.*\][[:space:]]*=[[:space:]]*require" && report "$f" "global[...] = require (require smuggling)" "$line"
+              # any write into the global object (quoted OR computed key):
+              # covers global['!']=... and global[_$_1e42[0]]=... alike.
+              echo "$line" | grep -qE "global[[:space:]]*\[.*\][[:space:]]*=" && report "$f" "global[...]= assignment (global tampering)" "$line"
+              # .constructor(...) used as a Function factory (obfuscation)
+              echo "$line" | grep -qE "\.constructor[[:space:]]*\("          && report "$f" ".constructor( used as Function factory" "$line"
+              # \uXXXX-escaped identifiers. The 2026-08 payload wrote
+              # require("\u0063\u0068\u0069\u006C\u0064\u005F...") so that NONE of the
+              # literal-string rules above matched, and GitHub code search found nothing.
+              # 3+ CONSECUTIVE escapes is obfuscation; a lone \u00e9 in a string is not.
+              echo "$line" | grep -qE '(\\u[0-9a-fA-F]{4}){3,}'                 && report "$f" "3+ consecutive \\uXXXX escapes (identifier obfuscation)" "$line"
+            done <<< "$added"
+
+            # --- Config-file-only patterns: no network in build config ---
+            if is_config "$f"; then
+              while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                echo "$line" | grep -qE 'https?://'          && report "$f" "network URL inside a config file" "$line"
+                echo "$line" | grep -qE '\bfetch[[:space:]]*\(' && report "$f" "fetch( inside a config file" "$line"
+                echo "$line" | grep -qE 'XMLHttpRequest'     && report "$f" "XMLHttpRequest inside a config file" "$line"
+              done <<< "$added"
+            fi
+
+            # --- Long-line / entropy blob check (skip lockfiles/minified — already excluded) ---
+            # Any single ADDED line longer than ~500 chars in a tracked non-minified
+            # source file is treated as an obfuscated/base64/hex payload.
+            while IFS= read -r line; do
+              if [ "${#line}" -gt 500 ]; then
+                report "$f" "single line > 500 chars (base64/hex/obfuscation blob)" "${line:0:120}...(${#line} chars)"
+              fi
+            done <<< "$added"
+          done < "$FILELIST"
+
+          # --- package.json lifecycle-script check (postinstall/preinstall/prepare) ---
+          # A NEW install-time script is the classic npm supply-chain foothold.
+          if grep -qx 'package.json' "$FILELIST"; then
+            pkg_added="$(git diff "origin/${BASE_REF}...HEAD" -- package.json \
+                          | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^\+//')"
+            echo "$pkg_added" | grep -qE '"(postinstall|preinstall|prepare)"[[:space:]]*:' \
+              && report "package.json" "NEW postinstall/preinstall/prepare lifecycle script added" \
+                        "$(echo "$pkg_added" | grep -E '"(postinstall|preinstall|prepare)"' | head -1)"
+          fi
+
+          echo "──────────────────────────────────────────────"
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::Obfuscation/malware scan FAILED. Review the flagged lines above."
+            echo "If a match is a legitimate false positive, adjust the code or gate the exception in this workflow with an explicit reviewer sign-off."
+            exit 1
+          fi
+          echo "✓ Obfuscation/malware scan passed (no danger patterns in PR-added lines)."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Secret scan — gitleaks over the PR range.
+  #    Non-blocking (continue-on-error): the gitleaks Action requires a license
+  #    key (GITLEAKS_LICENSE) for org repos; without it, it should warn, not
+  #    wall off every PR. Flip continue-on-error to false once the license/token
+  #    is set as a repo secret and you want it to be a hard gate.
+  # ─────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret scan (gitleaks — non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history so gitleaks can diff the PR range)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Org accounts require a license for gitleaks-action. Set this repo
+          # secret to enable; absent, the step is expected to warn/skip and the
+          # job still passes because of continue-on-error above.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: Secret-scan note
+        if: always()
+        run: |
+          echo "::notice::gitleaks runs non-blocking (continue-on-error). Set GITLEAKS_LICENSE"
+          echo "::notice::and change continue-on-error to false to make leaked secrets a hard gate."
