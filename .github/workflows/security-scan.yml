@@ -148,6 +148,48 @@ jobs:
             printf '%s\n' "$C2HITS" | sed 's/^/      /'
           fi
 
+          # (e) .vscode/settings.json that ARMS autorun.
+          # Rule (a) only ever looked at tasks.json/launch.json, so a byte-identical
+          # 786 B settings.json (blob 934d5554) sat on the default branch of 30
+          # repos — across three accounts and unrelated stacks — and passed every
+          # scan. It is the SILENCER for the tasks.json dropper:
+          #   "task.allowAutomaticTasks": true   -> removes the "Allow automatic
+          #                                         tasks in this folder?" prompt
+          #   "terminal.integrated.hideOnStartup": "always" -> runs unseen
+          #   a "tasks" block with "runOn": "folderOpen"
+          # tasks.json alone prompts. With this file, it does not.
+          for f in $(git ls-files | grep -E '(^|/)\.vscode/settings\.json$'); do
+            bad=""
+            grep -qE '"runOn"[[:space:]]*:[[:space:]]*"folderOpen"' "$f" && bad="$bad folderOpen-task"
+            grep -qE '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*(true|"on")' "$f" && bad="$bad allowAutomaticTasks"
+            if [ -n "$bad" ]; then
+              FAIL=1
+              printf '::error file=%s::AUTORUN ARMED via settings.json:%s\n' "$f" "$bad"
+              grep -nE '"(runOn|task\.allowAutomaticTasks|terminal\.integrated\.hideOnStartup)"' "$f" \
+                | head -4 | sed 's/^/      /'
+            fi
+          done
+
+          # (d) Build-tag / runtime markers from the 2026-08-12 npm-implant finding.
+          # That host had ~552 KB of payload appended to npm's own lib/cli.js
+          # (outside any repo), which spawned detached `node -e` stagers. None of
+          # these strings are plaintext in the repo droppers we removed, so this
+          # rule exists to catch the payload being COMMITTED, in any file type.
+          #
+          # Same exclusion as (c): the markers are written here as patterns, so an
+          # unfiltered grep matches this workflow and fails every repo. That exact
+          # mistake shipped once already.
+          IOC_RE='C260512A|RS260605|M260630A|NPM-eval|/0x/clb|q4FZkxX|__inzCR|app-cursor-eval|main\.inz\.cjs|global\.i='
+          IOCHITS=$(git grep -lIE "$IOC_RE" -- . 2>/dev/null \
+                    | grep -vE '(^|/)\.github/workflows/security-scan\.yml$')
+          if [ -n "$IOCHITS" ]; then
+            FAIL=1
+            printf '::error::KNOWN MALWARE MARKER (npm-implant family) found\n'
+            for f in $IOCHITS; do
+              printf '      %s: %s\n' "$f" "$(git grep -hoE "$IOC_RE" -- "$f" | sort -u | tr '\n' ' ')"
+            done
+          fi
+
           [ "$FAIL" -eq 0 ] || { echo "::error::Editor-autorun / disguised-binary sweep FAILED"; exit 1; }
           echo "Editor autorun + disguised binary sweep clean."
 
