@@ -92,16 +92,48 @@ jobs:
             fi
           done
 
-          # (b) A file with a font/binary extension whose magic bytes say otherwise.
-          #     Real: wOF2 wOFF OTTO 'true' 00 01 00 00. The payload was ASCII padded
-          #     with spaces so it looked blank in a diff.
+          # (b) A file with a font/image extension that is not really one.
+          #
+          #     Two INDEPENDENT signals, because either alone is trivially defeated:
+          #
+          #     b1 — the MIME TYPE is text. Match on `file --mime-type`, never on
+          #          `file -b`'s prose. v4 matched /ascii|utf-8|text/i against the
+          #          description and flagged a legitimate font whose style name is
+          #          "WeightExtraBold" — "Weigh(tExt)raBold". The MIME type is a
+          #          fixed vocabulary and has no such accidents.
+          #
+          #     b2 — obfuscation markers ANYWHERE in the bytes. b1 reads only the
+          #          leading bytes, so appending the payload to a genuine font keeps
+          #          the MIME type `font/…` and slips past it. Verified: real font +
+          #          appended payload is `application/octet-stream`, b1 says clean,
+          #          b2 catches it on global[…]=.
+          #
+          #     The real payload carried NO plaintext `require(`/`eval(`/
+          #     `child_process` — that is exactly what its \uXXXX encoding bought.
+          #     Matching those tokens would have missed it. These three markers are
+          #     what it could not hide, and they appear in neither genuine font.
           for f in $(git ls-files | grep -iE '\.(woff2?|ttf|otf|eot|png|jpg|jpeg|gif|ico)$'); do
             [ -s "$f" ] || continue
-            if file -b "$f" | grep -qiE 'ascii|utf-8|text'; then
+            mt=$(file -b --mime-type "$f" 2>/dev/null || echo unknown)
+            why=""
+            case "$mt" in
+              text/*|application/javascript|application/json|application/x-sh*|application/xml)
+                why="content is $mt, not a binary asset" ;;
+            esac
+            if [ -z "$why" ]; then
+              LC_ALL=C grep -qaE "global[[:space:]]*\[.*\][[:space:]]*=" "$f" && why="binary asset contains global[...]= (obfuscated loader)"
+            fi
+            if [ -z "$why" ]; then
+              LC_ALL=C grep -qaE '(\\u[0-9a-fA-F]{4}){3,}' "$f" && why="binary asset contains 3+ consecutive \\uXXXX escapes"
+            fi
+            if [ -z "$why" ]; then
+              LC_ALL=C grep -qaE '\.constructor[[:space:]]*\(' "$f" && why="binary asset contains .constructor( (Function factory)"
+            fi
+            if [ -n "$why" ]; then
               FAIL=1
-              printf '::error file=%s::DISGUISED FILE: %s extension but content is TEXT (%s)\n' \
-                "$f" "${f##*.}" "$(file -b "$f")"
-              printf '      %s bytes, first bytes: %s\n' "$(wc -c <"$f" | tr -d ' ')" "$(head -c 24 "$f" | tr -d '\0' | cat -v)"
+              printf '::error file=%s::DISGUISED FILE: %s extension but %s\n' "$f" "${f##*.}" "$why"
+              printf '      %s bytes, file says: %s\n' "$(wc -c <"$f" | tr -d ' ')" "$(file -b "$f")"
+              printf '      first bytes: %s\n' "$(head -c 24 "$f" | LC_ALL=C tr -d '\0' | LC_ALL=C cat -v)"
             fi
           done
 
